@@ -14,7 +14,7 @@ const router = createCheerioRouter();
 router.addHandler('START', async ({ enqueueLinks }) => {
     await enqueueLinks({
         label: 'DETAIL',
-        globs: ['**/examples/accept-user-input'],
+        include: ['**/examples/accept-user-input'],
     });
 });
 
@@ -22,8 +22,8 @@ router.addHandler('DETAIL', async ({ request, $ }) => {
     const { url } = request;
 
     const uniqueIdentifier = url.split('/').slice(-2).join('/');
-    const title = $('header h1').text();
-    const firstParagraph = $('header + p').text();
+    const title = $('.markdown h1').text();
+    const firstParagraph = $('.markdown > p').text();
     const modifiedDate = $('.theme-last-updated time').attr('datetime');
 
     await Dataset.pushData({

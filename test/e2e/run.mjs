@@ -1,12 +1,11 @@
 /* eslint-disable no-loop-func */
 import { execSync } from 'node:child_process';
-import { once } from 'node:events';
 import { readdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, Worker, workerData } from 'node:worker_threads';
 
-import { colors, getApifyToken, clearPackages, clearStorage, SKIPPED_TEST_CLOSE_CODE } from './tools.mjs';
+import { clearPackages, clearStorage, colors, getApifyToken, SKIPPED_TEST_CLOSE_CODE } from './tools.mjs';
 
 const basePath = dirname(fileURLToPath(import.meta.url));
 
@@ -46,62 +45,56 @@ async function run() {
         }
 
         const now = Date.now();
+        console.log(`${colors.yellow(`[${dir.name}] `)}${colors.grey('Test starting...')}`);
         const worker = new Worker(fileURLToPath(import.meta.url), {
             workerData: dir.name,
             stdout: true,
             stderr: true,
         });
         let seenFirst = false;
-        /** @type Map<string, string[]> */
-        const allLogs = new Map();
-        worker.stderr.on('data', (data) => {
-            const str = data.toString();
-            const taskLogs = allLogs.get(dir.name) ?? [];
-            allLogs.set(dir.name, taskLogs);
-            taskLogs.push(str);
-        });
-        worker.stdout.on('data', (data) => {
-            const str = data.toString();
-            const taskLogs = allLogs.get(dir.name) ?? [];
-            allLogs.set(dir.name, taskLogs);
-            taskLogs.push(str);
+        const prefix = colors.yellow(`[${dir.name}] `);
+        // Surface only lines that start with a structured `[…]` marker (init,
+        // assertion, build, run, kv, test skipped, etc.). Everything else
+        // (crawler INFO logs, per-URL request handler logs, npm warnings, …)
+        // is noise on a green run; buffer it and re-emit from the exit
+        // handler iff the test failed.
+        const deferredOnSuccess = [];
 
-            if (str.startsWith('[test skipped]')) {
-                return;
-            }
+        // Line-buffered streaming so prefixed lines stay intact across chunk boundaries.
+        const streamLines = (stream, sink) => {
+            let buffer = '';
+            stream.on('data', (chunk) => {
+                buffer += chunk.toString();
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (line === '') continue;
 
-            if (str.startsWith('[init]')) {
-                seenFirst = true;
-                return;
-            }
+                    if (!line.startsWith('[')) {
+                        if (!seenFirst) {
+                            console.log(
+                                `${colors.red('[fatal]')} test ${colors.yellow(
+                                    `[${dir.name}]`,
+                                )} did not call "initialize(import.meta.url)"!`,
+                            );
+                            worker.terminate();
+                            return;
+                        }
+                        deferredOnSuccess.push(line);
+                        continue;
+                    }
 
-            if (!seenFirst) {
-                console.log(
-                    `${colors.red('[fatal]')} test ${colors.yellow(
-                        `[${dir.name}]`,
-                    )} did not call "initialize(import.meta.url)"!`,
-                );
-                worker.terminate();
-                return;
-            }
-
-            if (
-                process.env.STORAGE_IMPLEMENTATION === 'PLATFORM' &&
-                (str.startsWith('[build]') || str.startsWith('[run]') || str.startsWith('[kv]'))
-            ) {
-                const platformStatsMessage = str.match(/\[(?:run|build|kv)] (.*)/);
-                if (platformStatsMessage) {
-                    console.log(`${colors.yellow(`[${dir.name}] `)}${colors.grey(platformStatsMessage[1])}`);
+                    seenFirst = true;
+                    sink(`${prefix}${line}`);
                 }
-            }
+            });
+            stream.on('end', () => {
+                if (buffer !== '') sink(`${prefix}${buffer}`);
+            });
+        };
 
-            const match = str.match(/\[assertion] (passed|failed): (.*)/);
-
-            if (match) {
-                const c = match[1] === 'passed' ? colors.green : colors.red;
-                console.log(`${colors.yellow(`[${dir.name}] `)}${match[2]}: ${c(match[1])}`);
-            }
-        });
+        streamLines(worker.stdout, (line) => console.log(line));
+        streamLines(worker.stderr, (line) => console.error(line));
 
         worker.on('error', (err) => {
             // If the worker emits any error, we want to exit with a non-zero code
@@ -109,10 +102,14 @@ async function run() {
             console.log(`${colors.red('[fatal]')} test ${colors.yellow(`[${dir.name}]`)} failed with error: ${err}`);
         });
 
-        worker.on('exit', async (code) => {
+        const exitHandler = async (code) => {
             if (code === SKIPPED_TEST_CLOSE_CODE) {
-                console.log(`Test ${colors.yellow(`[${dir.name}]`)} was skipped`);
+                console.log(`${prefix}${colors.grey('Test skipped')}`);
                 return;
+            }
+
+            if (code !== 0) {
+                for (const line of deferredOnSuccess) console.log(`${prefix}${line}`);
             }
 
             const took = (Date.now() - now) / 1000;
@@ -132,16 +129,20 @@ async function run() {
                 await clearPackages(`${basePath}/${dir.name}`);
             }
 
-            const taskLogs = allLogs.get(dir.name);
-
-            if (code !== 0 && taskLogs?.length > 0) {
-                console.log(taskLogs.join('\n'));
-            }
-
             if (status === 'failure') failure = true;
+        };
+
+        const { promise: waitForExit, resolve: markTestDone } = Promise.withResolvers();
+
+        worker.on('exit', async (exitCode) => {
+            try {
+                await exitHandler(exitCode);
+            } finally {
+                markTestDone();
+            }
         });
 
-        await once(worker, 'exit');
+        await waitForExit;
     }
 }
 
@@ -149,19 +150,31 @@ if (isMainThread) {
     try {
         if (process.env.STORAGE_IMPLEMENTATION === 'LOCAL') {
             console.log('Temporary installing @apify/storage-local');
-            execSync(`yarn add -D @apify/storage-local@^2.1.3-beta.1 > /dev/null`, { stdio: 'inherit' });
+            execSync(`pnpm add -w -D "@apify/storage-local@^3.0.0"`, { stdio: 'inherit' });
         }
         if (process.env.STORAGE_IMPLEMENTATION !== 'PLATFORM') {
-            console.log('Fetching camoufox');
-            execSync(`npx camoufox-js fetch > /dev/null`, { stdio: 'inherit' });
+            console.log('Fetching Camoufox...');
+
+            for (let attempt = 0; attempt < 5; attempt++) {
+                try {
+                    execSync(`pnpm exec camoufox-js fetch`, { stdio: 'inherit' });
+                    break;
+                } catch (e) {
+                    console.error('Failed to fetch Camoufox', e);
+                    if (attempt === 4) throw e;
+                    console.log(`Retrying to fetch Camoufox (attempt ${attempt + 2}/5)...`);
+                    await new Promise((resolve) => setTimeout(resolve, 10e3));
+                }
+            }
         }
         await run();
     } catch (e) {
+        failure = true;
         console.error(e);
     } finally {
         if (process.env.STORAGE_IMPLEMENTATION === 'LOCAL') {
             console.log('Removing temporary installation of @apify/storage-local');
-            execSync(`yarn remove @apify/storage-local > /dev/null`, { stdio: 'inherit' });
+            execSync(`pnpm remove -w @apify/storage-local`, { stdio: 'inherit' });
         }
     }
 

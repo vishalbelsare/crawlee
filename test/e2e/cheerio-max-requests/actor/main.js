@@ -1,5 +1,5 @@
 import { Actor } from 'apify';
-import { CheerioCrawler, Dataset } from '@crawlee/cheerio';
+import { CheerioCrawler, ConcurrencySystem, Dataset } from '@crawlee/cheerio';
 
 const mainOptions = {
     exit: Actor.isAtHome(),
@@ -10,9 +10,12 @@ const mainOptions = {
 };
 
 await Actor.main(async () => {
+    // The caller owns an injected system's lifecycle - start it before the crawler runs and stop it afterwards.
+    const concurrencySystem = new ConcurrencySystem({ desiredConcurrency: 2 });
+
     const crawler = new CheerioCrawler({
         maxRequestsPerCrawl: 10,
-        autoscaledPoolOptions: { desiredConcurrency: 2 },
+        concurrencySystem,
         async requestHandler({ $, request }) {
             const {
                 url,
@@ -34,8 +37,8 @@ await Actor.main(async () => {
                 }
             } else if (label === 'DETAIL') {
                 const uniqueIdentifier = url.split('/').slice(-2).join('/');
-                const title = $('header h1').text();
-                const firstParagraph = $('header + p').text();
+                const title = $('.markdown h1').text();
+                const firstParagraph = $('.markdown > p').text();
                 const modifiedDate = $('.theme-last-updated time').attr('datetime');
 
                 await Dataset.pushData({
@@ -49,5 +52,10 @@ await Actor.main(async () => {
         },
     });
 
-    await crawler.run([{ url: 'https://crawlee.dev/js/docs/examples', userData: { label: 'START' } }]);
+    await concurrencySystem.start();
+    try {
+        await crawler.run([{ url: 'https://crawlee.dev/js/docs/examples', userData: { label: 'START' } }]);
+    } finally {
+        await concurrencySystem.stop();
+    }
 }, mainOptions);

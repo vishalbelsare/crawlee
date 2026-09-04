@@ -9,7 +9,7 @@ log.setLevel(LogLevel.DEBUG);
 // that automatically loads the URLs and parses their HTML using the cheerio library.
 const crawler = new CheerioCrawler({
     // The crawler downloads and processes the web pages in parallel, with a concurrency
-    // automatically managed based on the available system memory and CPU (see AutoscaledPool class).
+    // automatically managed based on the available system memory and CPU (see ConcurrencySystem class).
     // Here we define some hard limits for the concurrency.
     minConcurrency: 10,
     maxConcurrency: 50,
@@ -35,7 +35,7 @@ const crawler = new CheerioCrawler({
         // Extract data from the page using cheerio.
         const title = $('title').text();
         const h1texts: { text: string }[] = [];
-        $('h1').each((index, el) => {
+        $('h1').each((_, el) => {
             h1texts.push({
                 text: $(el).text(),
             });
